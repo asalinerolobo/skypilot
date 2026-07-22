@@ -6,6 +6,7 @@ import dataclasses
 import enum
 import functools
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -1101,6 +1102,16 @@ def get_active_file_mounts_blob_ids() -> set:
     ).get_active_file_mounts_blob_ids()
 
 
+def try_acquire_daemon_leader_lock() -> bool:
+    """Try to acquire the daemon leader lock.
+
+    In multi-replica setups, only one replica should run internal daemons
+    to avoid duplicate work. Returns True if this instance is the leader.
+    """
+    return request_storage.get_request_backend().try_acquire_daemon_leader_lock(
+    )
+
+
 _add_or_update_request_sql = (f'INSERT OR REPLACE INTO {REQUEST_TABLE} '
                               f'({", ".join(REQUEST_COLUMNS)}) VALUES '
                               f'({", ".join(["?"] * len(REQUEST_COLUMNS))})')
@@ -1136,11 +1147,7 @@ def set_exception_stacktrace(e: BaseException) -> None:
 def set_request_failed(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
     set_exception_stacktrace(e)
-    with update_request(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.FAILED
-        request_task.finished_at = time.time()
-        request_task.set_error(e)
+    request_storage.get_request_backend().mark_failed(request_id, e)
 
 
 @metrics_lib.time_me_async
@@ -1148,22 +1155,12 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
 async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
     set_exception_stacktrace(e)
-    storage = request_storage.get_request_backend()
-    async with storage.update_request_async(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.FAILED
-        request_task.finished_at = time.time()
-        request_task.set_error(e)
+    await request_storage.get_request_backend().mark_failed_async(request_id, e)
 
 
 def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
     """Set a request to succeeded and populate the result."""
-    with update_request(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.SUCCEEDED
-        request_task.finished_at = time.time()
-        if result is not None:
-            request_task.set_return_value(result)
+    request_storage.get_request_backend().mark_succeeded(request_id, result)
 
 
 @metrics_lib.time_me_async
@@ -1171,13 +1168,8 @@ def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
 async def set_request_succeeded_async(request_id: str,
                                       result: Optional[Any]) -> None:
     """Set a request to succeeded and populate the result."""
-    storage = request_storage.get_request_backend()
-    async with storage.update_request_async(request_id) as request_task:
-        assert request_task is not None, request_id
-        request_task.status = RequestStatus.SUCCEEDED
-        request_task.finished_at = time.time()
-        if result is not None:
-            request_task.set_return_value(result)
+    await request_storage.get_request_backend().mark_succeeded_async(
+        request_id, result)
 
 
 @metrics_lib.time_me_async
@@ -1343,7 +1335,60 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                 'set.')
         self._engine = db_utils.get_engine(None)
         self._async_engine = db_utils.get_engine(None, async_engine=True)
+        self._daemon_leader_conn = None
+        self._init_prepared_statements()
         self._create_table()
+
+    def _init_prepared_statements(self) -> None:
+        self._upsert_sql: str = self._rewrite_sql(_add_or_update_request_sql)
+        self._upsert_text = sqlalchemy.text(
+            self._bind_sql(self._upsert_sql, ['?'] * len(REQUEST_COLUMNS))[0])
+
+        self._insert_on_conflict_nothing_sql = sqlalchemy.text(
+            f'INSERT INTO {REQUEST_TABLE} '
+            f'({", ".join(REQUEST_COLUMNS)}) VALUES '
+            f'({", ".join([":p" + str(i) for i in range(len(REQUEST_COLUMNS))])}) '
+            f'ON CONFLICT(request_id) DO NOTHING '
+            f'RETURNING request_id')
+
+        self._select_all_sql = sqlalchemy.text(
+            f'SELECT {", ".join(REQUEST_COLUMNS)} '
+            f'FROM {REQUEST_TABLE} WHERE request_id = :p0')
+
+        executable_statuses = RequestStatus.executable_statuses()
+        self._mark_running_sql = sqlalchemy.text(
+            f'UPDATE {REQUEST_TABLE} SET status = :status, pid = :pid, '
+            f'status_msg = :status_msg '
+            f'WHERE request_id = :request_id AND status '
+            f'IN ({",".join(f":s{i}" for i in range(len(executable_statuses)))})'
+        )
+
+        self._mark_succeeded_sql = sqlalchemy.text(
+            f'UPDATE {REQUEST_TABLE} SET status = :status, '
+            f'return_value = :return_value, '
+            f'{COL_FINISHED_AT} = :finished_at '
+            f'WHERE request_id = :request_id AND status = :current_status')
+
+        self._mark_failed_sql = sqlalchemy.text(
+            f'UPDATE {REQUEST_TABLE} SET status = :status, '
+            f'error = :error, '
+            f'{COL_FINISHED_AT} = :finished_at '
+            f'WHERE request_id = :request_id AND status = :current_status')
+
+        self._update_status_sql = sqlalchemy.text(
+            f'UPDATE {REQUEST_TABLE} SET status = :status '
+            f'WHERE request_id = :request_id AND status IN '
+            f'({",".join(f":s{i}" for i in range(len(executable_statuses)))})')
+
+        self._update_status_msg_sql = sqlalchemy.text(
+            f'UPDATE {REQUEST_TABLE} SET status_msg = :status_msg '
+            f'WHERE request_id = :request_id')
+
+        self._cancel_request_sql = sqlalchemy.text(
+            f'UPDATE {REQUEST_TABLE} SET status = :status, '
+            f'{COL_FINISHED_AT} = :finished_at '
+            f'WHERE request_id = :request_id AND status IN '
+            f'(:pending_status, :running_status, :waiting_status)')
 
     @staticmethod
     def _lock_key(request_id: str) -> int:
@@ -1487,6 +1532,12 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             conn,
             request_id: str,
             fields: Optional[List[str]] = None) -> Optional[Request]:
+        if fields is None and len(request_id) >= _FULL_REQUEST_ID_LEN:
+            result = conn.execute(self._select_all_sql, {'p0': request_id})
+            row = result.fetchone()
+            if row is None:
+                return None
+            return Request.from_row(tuple(row))
         columns_str = ', '.join(fields) if fields else ', '.join(
             REQUEST_COLUMNS)
         where, params = _request_id_where(request_id)
@@ -1507,6 +1558,13 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             conn,
             request_id: str,
             fields: Optional[List[str]] = None) -> Optional[Request]:
+        if fields is None and len(request_id) >= _FULL_REQUEST_ID_LEN:
+            result = await conn.execute(self._select_all_sql,
+                                        {'p0': request_id})
+            row = result.fetchone()
+            if row is None:
+                return None
+            return Request.from_row(tuple(row))
         columns_str = ', '.join(fields) if fields else ', '.join(
             REQUEST_COLUMNS)
         where, params = _request_id_where(request_id)
@@ -1523,13 +1581,15 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         return Request.from_row(row)
 
     def _add_or_update_request_on_conn(self, conn, request: Request) -> None:
-        self._execute_on_conn(conn, _add_or_update_request_sql,
-                              request.to_row())
+        row = request.to_row()
+        _, bind_params = self._bind_sql(self._upsert_sql, row)
+        conn.execute(self._upsert_text, bind_params)
 
     async def _add_or_update_request_on_async_conn(self, conn,
                                                    request: Request) -> None:
-        await self._execute_on_async_conn(conn, _add_or_update_request_sql,
-                                          request.to_row())
+        row = request.to_row()
+        _, bind_params = self._bind_sql(self._upsert_sql, row)
+        await conn.execute(self._upsert_text, bind_params)
 
     def get_request(self,
                     request_id: str,
@@ -1567,22 +1627,19 @@ class PostgresRequestBackend(request_storage.RequestBackend):
 
     @asyncio_utils.shield
     async def create_if_not_exists_async(self, request: Request) -> bool:
-        request_columns = ', '.join(REQUEST_COLUMNS)
-        values_str = ', '.join(['?'] * len(REQUEST_COLUMNS))
-        sql_statement = (f'INSERT INTO {REQUEST_TABLE} '
-                         f'({request_columns}) VALUES '
-                         f'({values_str}) ON CONFLICT(request_id) DO NOTHING '
-                         f'RETURNING ROWID')
+        row = request.to_row()
+        bind_params = {f'p{i}': v for i, v in enumerate(row)}
         if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
             logger.debug(f'Start creating request {request.request_id}')
         try:
-            row = await self._execute_async(sql_statement,
-                                            request.to_row(),
-                                            fetch_one=True)
+            async with self._async_engine.begin() as conn:
+                result = await conn.execute(
+                    self._insert_on_conflict_nothing_sql, bind_params)
+                inserted = result.fetchone() is not None
         finally:
             if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
                 logger.debug(f'End creating request {request.request_id}')
-        return True if row else False
+        return inserted
 
     @asyncio_utils.shield
     async def create_or_refresh_internal_daemon_async(self,
@@ -1655,16 +1712,126 @@ class PostgresRequestBackend(request_storage.RequestBackend):
     @asyncio_utils.shield
     async def update_status_async(self, request_id: str,
                                   status: RequestStatus) -> None:
-        async with self.update_request_async(request_id) as request:
-            if request is not None:
-                request.status = status
+        executable_statuses = RequestStatus.executable_statuses()
+        params: Dict[str, Any] = {
+            'status': status.value,
+            'request_id': request_id,
+        }
+        for i, s in enumerate(executable_statuses):
+            params[f's{i}'] = s.value
+        async with self._async_engine.begin() as conn:
+            await conn.execute(self._update_status_sql, params)
 
     @asyncio_utils.shield
     async def update_status_msg_async(self, request_id: str,
                                       status_msg: str) -> None:
-        async with self.update_request_async(request_id) as request:
-            if request is not None:
-                request.status_msg = status_msg
+        async with self._async_engine.begin() as conn:
+            await conn.execute(self._update_status_msg_sql, {
+                'status_msg': status_msg,
+                'request_id': request_id,
+            })
+
+    def mark_running(self, request_id: str, pid: int) -> bool:
+        executable_statuses = RequestStatus.executable_statuses()
+        params: Dict[str, Any] = {
+            'status': RequestStatus.RUNNING.value,
+            'pid': pid,
+            'status_msg': '',
+            'request_id': request_id,
+        }
+        for i, s in enumerate(executable_statuses):
+            params[f's{i}'] = s.value
+        with self._engine.begin() as conn:
+            result = conn.execute(self._mark_running_sql, params)
+            return result.rowcount > 0
+
+    async def mark_running_async(self, request_id: str, pid: int) -> bool:
+        executable_statuses = RequestStatus.executable_statuses()
+        params: Dict[str, Any] = {
+            'status': RequestStatus.RUNNING.value,
+            'pid': pid,
+            'status_msg': '',
+            'request_id': request_id,
+        }
+        for i, s in enumerate(executable_statuses):
+            params[f's{i}'] = s.value
+        async with self._async_engine.begin() as conn:
+            result = await conn.execute(self._mark_running_sql, params)
+            return result.rowcount > 0
+
+    def mark_succeeded(self, request_id: str, return_value: Any) -> None:
+        with self._engine.begin() as conn:
+            name_result = conn.execute(
+                sqlalchemy.text(f'SELECT name FROM {REQUEST_TABLE} '
+                                f'WHERE request_id = :rid'),
+                {'rid': request_id})
+            name_row = name_result.fetchone()
+            request_name = name_row[0] if name_row else ''
+            encoded_rv = encoders.get_encoder(request_name)(return_value)
+            conn.execute(
+                self._mark_succeeded_sql, {
+                    'status': RequestStatus.SUCCEEDED.value,
+                    'return_value': json.dumps(encoded_rv),
+                    'finished_at': time.time(),
+                    'request_id': request_id,
+                    'current_status': RequestStatus.RUNNING.value,
+                })
+
+    async def mark_succeeded_async(self, request_id: str,
+                                   return_value: Any) -> None:
+        async with self._async_engine.begin() as conn:
+            name_result = await conn.execute(
+                sqlalchemy.text(f'SELECT name FROM {REQUEST_TABLE} '
+                                f'WHERE request_id = :rid'),
+                {'rid': request_id})
+            name_row = name_result.fetchone()
+            request_name = name_row[0] if name_row else ''
+            encoded_rv = encoders.get_encoder(request_name)(return_value)
+            await conn.execute(
+                self._mark_succeeded_sql, {
+                    'status': RequestStatus.SUCCEEDED.value,
+                    'return_value': json.dumps(encoded_rv),
+                    'finished_at': time.time(),
+                    'request_id': request_id,
+                    'current_status': RequestStatus.RUNNING.value,
+                })
+
+    def mark_failed(self, request_id: str, error: BaseException) -> None:
+        set_exception_stacktrace(error)
+        serialized = exceptions.serialize_exception(error)
+        error_data = {
+            'object': encoders.pickle_and_encode(serialized),
+            'type': type(error).__name__,
+            'message': str(error),
+        }
+        with self._engine.begin() as conn:
+            conn.execute(
+                self._mark_failed_sql, {
+                    'status': RequestStatus.FAILED.value,
+                    'error': json.dumps(error_data),
+                    'finished_at': time.time(),
+                    'request_id': request_id,
+                    'current_status': RequestStatus.RUNNING.value,
+                })
+
+    async def mark_failed_async(self, request_id: str,
+                                error: BaseException) -> None:
+        set_exception_stacktrace(error)
+        serialized = exceptions.serialize_exception(error)
+        error_data = {
+            'object': encoders.pickle_and_encode(serialized),
+            'type': type(error).__name__,
+            'message': str(error),
+        }
+        async with self._async_engine.begin() as conn:
+            await conn.execute(
+                self._mark_failed_sql, {
+                    'status': RequestStatus.FAILED.value,
+                    'error': json.dumps(error_data),
+                    'finished_at': time.time(),
+                    'request_id': request_id,
+                    'current_status': RequestStatus.RUNNING.value,
+                })
 
     def kill_requests(self,
                       request_ids: Optional[List[str]] = None,
@@ -1680,35 +1847,34 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             ]
         cancelled = []
         for request_id in request_ids:
-            with self.update_request(request_id) as request_record:
-                if not _should_kill_request(request_id, request_record):
-                    continue
-                assert request_record is not None
-                if request_record.pid is not None:
-                    logger.warning(
-                        'Postgres request backend cannot safely signal API '
-                        'worker pid %s from this process; marking request %s '
-                        'cancelled in the request DB.', request_record.pid,
-                        request_id)
-                request_record.status = RequestStatus.CANCELLED
-                request_record.finished_at = time.time()
-                cancelled.append(request_id)
+            with self._engine.begin() as conn:
+                self._acquire_request_lock(conn, request_id)
+                result = conn.execute(
+                    self._cancel_request_sql, {
+                        'status': RequestStatus.CANCELLED.value,
+                        'finished_at': time.time(),
+                        'request_id': request_id,
+                        'pending_status': RequestStatus.PENDING.value,
+                        'running_status': RequestStatus.RUNNING.value,
+                        'waiting_status': RequestStatus.WAITING.value,
+                    })
+                if result.rowcount > 0:
+                    cancelled.append(request_id)
         return cancelled
 
     @asyncio_utils.shield
     async def kill_request_async(self, request_id: str) -> bool:
-        async with self.update_request_async(request_id) as request:
-            if not _should_kill_request(request_id, request):
-                return False
-            assert request is not None
-            if request.pid is not None:
-                logger.warning(
-                    'Postgres request backend cannot safely signal API worker '
-                    'pid %s from this process; marking request %s cancelled in '
-                    'the request DB.', request.pid, request_id)
-            request.status = RequestStatus.CANCELLED
-            request.finished_at = time.time()
-        return True
+        async with self._async_engine.begin() as conn:
+            result = await conn.execute(
+                self._cancel_request_sql, {
+                    'status': RequestStatus.CANCELLED.value,
+                    'finished_at': time.time(),
+                    'request_id': request_id,
+                    'pending_status': RequestStatus.PENDING.value,
+                    'running_status': RequestStatus.RUNNING.value,
+                    'waiting_status': RequestStatus.WAITING.value,
+                })
+            return result.rowcount > 0
 
     async def get_latest_request_id_async(self) -> Optional[str]:
         rows = await self._execute_async(
@@ -1814,7 +1980,39 @@ class PostgresRequestBackend(request_storage.RequestBackend):
     def reset_on_startup(self) -> None:
         self._create_table()
 
+    def try_acquire_daemon_leader_lock(self) -> bool:
+        """Try to acquire the daemon leader lock.
+
+        Uses a session-level pg_advisory_lock so that only one replica
+        runs the internal daemons. The lock is held for the lifetime of
+        the process and released on disconnect.
+
+        Returns:
+            True if this replica acquired the lock (is the leader).
+        """
+        try:
+            with self._engine.connect() as conn:
+                result = conn.execute(
+                    sqlalchemy.text('SELECT pg_try_advisory_lock(:lock_key)'),
+                    {'lock_key': self._lock_key('daemon-leader')})
+                row = result.fetchone()
+                acquired = row[0] if row else False
+                if acquired:
+                    # Keep the connection alive for the lifetime of this
+                    # process so the lock is held until the server exits.
+                    # The connection is detached from the pool so it won't
+                    # be recycled.
+                    conn.detach()
+                    self._daemon_leader_conn = conn
+                return bool(acquired)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning('Failed to acquire daemon leader lock, '
+                           'assuming leader')
+            return True
+
     async def close(self):
+        if hasattr(self, '_daemon_leader_conn') and self._daemon_leader_conn:
+            self._daemon_leader_conn.close()
         await self._async_engine.dispose()
         self._engine.dispose()
 

@@ -53,6 +53,7 @@ from sky.server.requests import preconditions
 from sky.server.requests import process
 from sky.server.requests import request_names
 from sky.server.requests import requests as api_requests
+from sky.server.requests import storage as request_storage
 from sky.server.requests import threads
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
@@ -724,22 +725,24 @@ def _request_execution_wrapper(request_id: str,
         # As soon as the request is updated with the executor PID, we can
         # receive SIGTERM from cancellation. So, we update the request inside
         # the try block to ensure we have the KeyboardInterrupt handling.
-        with api_requests.update_request(request_id) as request_task:
-            assert request_task is not None, request_id
-            if (request_task.status
-                    not in api_requests.RequestStatus.executable_statuses()):
-                logger.warning(
-                    f'Request is already {request_task.status.value}, '
-                    f'skipping execution')
-                return
-            log_path = request_task.log_path
-            request_task.pid = pid
-            request_task.status = api_requests.RequestStatus.RUNNING
-            # Clear any leftover retry-backoff message now that we are running.
-            request_task.status_msg = None
-            func = request_task.entrypoint
-            request_body = request_task.request_body
-            request_name = request_task.name
+        # Read request data first (no lock needed - just reading immutable
+        # fields for dispatch), then use targeted UPDATE for the
+        # PENDING->RUNNING transition to avoid the overhead of advisory lock
+        # + full read-modify-write cycle.
+        request_task = api_requests.get_request(request_id)
+        if request_task is None:
+            logger.warning(f'Request {request_id} not found, skipping')
+            return
+        if (request_task.status
+                not in api_requests.RequestStatus.executable_statuses()):
+            logger.warning(f'Request is already {request_task.status.value}, '
+                           f'skipping execution')
+            return
+        log_path = request_task.log_path
+        func = request_task.entrypoint
+        request_body = request_task.request_body
+        request_name = request_task.name
+        request_storage.get_request_backend().mark_running(request_id, pid)
 
         # Store copies of the original stdout and stderr file descriptors
         # We do this in two steps because we should make sure to restore the

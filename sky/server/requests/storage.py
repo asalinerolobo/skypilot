@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import os
+import time
 from typing import (AsyncGenerator, Generator, List, Optional, Set, Tuple,
                     TYPE_CHECKING)
 
@@ -195,8 +196,94 @@ class RequestBackend(abc.ABC):
         """Get (request_id, name) pairs to wait for during graceful shutdown."""
         raise NotImplementedError
 
+    def mark_running(self, request_id: str, pid: int) -> bool:
+        """Transition a request to RUNNING with the given pid.
+
+        Returns True if the transition succeeded (row was in PENDING/WAITING).
+        Default implementation uses read-modify-write; backends with
+        efficient targeted UPDATEs should override.
+        """
+        with self.update_request(request_id) as request:
+            if request is None:
+                return False
+            if request.status not in (RequestStatus.PENDING,
+                                      RequestStatus.WAITING):
+                return False
+            request.status = RequestStatus.RUNNING
+            request.pid = pid
+            request.status_msg = None
+            return True
+
+    async def mark_running_async(self, request_id: str, pid: int) -> bool:
+        """Async version of mark_running."""
+        async with self.update_request_async(request_id) as request:
+            if request is None:
+                return False
+            if request.status not in (RequestStatus.PENDING,
+                                      RequestStatus.WAITING):
+                return False
+            request.status = RequestStatus.RUNNING
+            request.pid = pid
+            request.status_msg = None
+            return True
+
+    def mark_succeeded(self, request_id: str, return_value) -> None:
+        """Transition a RUNNING request to SUCCEEDED with a return value.
+
+        Default implementation uses read-modify-write; backends with
+        efficient targeted UPDATEs should override.
+        """
+        with self.update_request(request_id) as request:
+            if request is not None:
+                request.status = RequestStatus.SUCCEEDED
+                request.finished_at = time.time()
+                if return_value is not None:
+                    request.set_return_value(return_value)
+
+    async def mark_succeeded_async(self, request_id: str, return_value) -> None:
+        """Async version of mark_succeeded."""
+        async with self.update_request_async(request_id) as request:
+            if request is not None:
+                request.status = RequestStatus.SUCCEEDED
+                request.finished_at = time.time()
+                if return_value is not None:
+                    request.set_return_value(return_value)
+
+    def mark_failed(self, request_id: str, error: BaseException) -> None:
+        """Transition a RUNNING request to FAILED with an error.
+
+        Default implementation uses read-modify-write; backends with
+        efficient targeted UPDATEs should override.
+        """
+        with self.update_request(request_id) as request:
+            if request is not None:
+                request.status = RequestStatus.FAILED
+                request.finished_at = time.time()
+                request.set_error(error)
+
+    async def mark_failed_async(self, request_id: str,
+                                error: BaseException) -> None:
+        """Async version of mark_failed."""
+        async with self.update_request_async(request_id) as request:
+            if request is not None:
+                request.status = RequestStatus.FAILED
+                request.finished_at = time.time()
+                request.set_error(error)
+
     def reset_on_startup(self) -> None:
         """Called on server startup for backend-specific initialization."""
+
+    def try_acquire_daemon_leader_lock(self) -> bool:
+        """Try to acquire the daemon leader lock.
+
+        In multi-replica setups, only the leader should run internal daemons
+        (status refresh, volume refresh, etc.) to avoid duplicate work and
+        DB contention. Single-process backends (SQLite) always return True.
+
+        Returns:
+            True if this instance is the daemon leader.
+        """
+        return True
 
     async def close(self) -> None:
         """Release resources (engines, connections, etc.)."""

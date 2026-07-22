@@ -817,12 +817,16 @@ async def lifespan(app: fastapi.FastAPI):  # pylint: disable=redefined-outer-nam
     # Startup: Run background tasks. Delete any persisted daemon rows whose
     # ids are no longer in INTERNAL_REQUEST_DAEMONS first (daemon renamed /
     # removed in code), then submit each current daemon.
+    # In multi-replica setups, only the leader should run daemons to avoid
+    # duplicate work and DB contention.
+    is_daemon_leader = requests_lib.try_acquire_daemon_leader_lock()
     await requests_lib.delete_orphan_internal_daemons_async(
         daemons.INTERNAL_REQUEST_DAEMONS)
-    for event in daemons.INTERNAL_REQUEST_DAEMONS:
-        if event.should_skip():
-            continue
-        await executor.schedule_internal_daemon_async(event)
+    if is_daemon_leader:
+        for event in daemons.INTERNAL_REQUEST_DAEMONS:
+            if event.should_skip():
+                continue
+            await executor.schedule_internal_daemon_async(event)
     await schedule_on_boot_check_async()
     asyncio.create_task(cleanup_upload_ids())
     # Start periodic version check task (runs daily)
